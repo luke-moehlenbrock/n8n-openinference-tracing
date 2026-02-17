@@ -765,24 +765,20 @@ function setupN8nOpenTelemetry() {
      */
     const originalRunNode = WorkflowExecute.prototype.runNode
     /**
-     * @param {import('n8n-workflow').Workflow} workflow
-     * @param {import('n8n-workflow').IExecuteData} executionData
-     * @param {import('n8n-workflow').IRunExecutionData} runExecutionData
-     * @param {number} runIndex
-     * @param {import('n8n-workflow').IWorkflowExecuteAdditionalData} additionalData
-     * @param {import('n8n-workflow').WorkflowExecuteMode} mode
-     * @param {AbortSignal} [abortSignal]
-     * @returns {Promise<import('n8n-workflow').IRunNodeResponse>}
+     * Patched runNode that wraps each node execution in an OpenTelemetry span.
+     *
+     * IMPORTANT: Uses `arguments` to forward ALL parameters to the original
+     * runNode, ensuring compatibility with newer n8n versions that may add
+     * parameters (e.g. EngineResponse for V3 agent tool-call continuations).
+     * Explicitly listing parameters would silently drop any new ones, breaking
+     * the agent's ability to receive tool results.
      */
-    WorkflowExecute.prototype.runNode = async function (
-      workflow,
-      executionData,
-      runExecutionData,
-      runIndex,
-      additionalData,
-      mode,
-      abortSignal,
-    ) {
+    WorkflowExecute.prototype.runNode = async function () {
+      // Read args positionally for span metadata, but pass ALL args through
+      const workflow = arguments[0]
+      const executionData = arguments[1]
+      const additionalData = arguments[4]
+
       // Safeguard against undefined this context
       if (!this) {
         console.warn('WorkflowExecute context is undefined')
@@ -812,7 +808,6 @@ function setupN8nOpenTelemetry() {
         }
       }
 
-      // Debug logging, uncomment as needed
       if (DEBUG) {
         console.debug(`${LOGPREFIX} Executing node:`, node.name)
       }
@@ -822,19 +817,14 @@ function setupN8nOpenTelemetry() {
       if (MAP_OPENINFERENCE_SPAN_KINDS) {
         spanKind = mapNodeToSpanKind(node?.type, n8nNodeAttrs)
       }
-      // Default to CHAIN if no mapping found
       if (!spanKind) spanKind = 'CHAIN'
 
       // Build OpenInference attributes for the node span
       const nodeAttributes = {
-        // Required: OpenInference span kind
         'openinference.span.kind': spanKind,
-        // Session & user context
         'session.id': sessionId,
         'user.id': userId,
-        // n8n metadata
         ...n8nNodeAttrs,
-        // Metadata as JSON string
         'metadata': safeJSONStringify({
           'n8n.workflow.id': workflow?.id ?? 'unknown',
           'n8n.execution.id': executionId,
@@ -845,7 +835,6 @@ function setupN8nOpenTelemetry() {
 
       let nodeSpanName
       if (USE_NODE_NAME_SPAN) {
-        // Use raw node name for maximum readability; fall back if missing
         nodeSpanName = node?.name || 'unknown-node'
       } else if (SPAN_KIND_IN_NODE_SPAN_NAME && spanKind) {
         nodeSpanName = `n8n.node.${spanKind}.execute`
@@ -853,22 +842,22 @@ function setupN8nOpenTelemetry() {
         nodeSpanName = 'n8n.node.execute'
       }
 
+      // Capture the original arguments to pass through
+      const originalArgs = arguments
+
       return tracer.startActiveSpan(
         nodeSpanName,
         { attributes: nodeAttributes, kind: SpanKind.INTERNAL },
         async (nodeSpan) => {
           // Capture node input *before* execution (OpenInference input.value)
-          // Uses executionData.data (actual resolved values) rather than node.parameters (raw expressions)
           if (CAPTURE_IO) {
             try {
               const inputObj = extractNodeInputFromExecutionData(executionData)
               if (inputObj) {
                 const inputStr = truncateIO(safeJSONStringify(inputObj))
-                // OpenInference input attributes
                 nodeSpan.setAttribute('input.value', inputStr)
                 nodeSpan.setAttribute('input.mime_type', 'application/json')
 
-                // For LLM spans, try to extract messages from the resolved input
                 if (spanKind === 'LLM') {
                   const inputData = Array.isArray(inputObj) ? inputObj[0] : inputObj
                   const userContent = inputData?.chatInput || inputData?.text || inputData?.prompt || inputData?.query
@@ -885,43 +874,43 @@ function setupN8nOpenTelemetry() {
             }
           }
           try {
-            const result = await originalRunNode.apply(this, [
-              workflow,
-              executionData,
-              runExecutionData,
-              runIndex,
-              additionalData,
-              mode,
-              abortSignal,
-            ])
+            // Pass ALL original arguments through to preserve compatibility
+            // with newer n8n versions (e.g. EngineResponse parameter for V3 agents)
+            const result = await originalRunNode.apply(this, originalArgs)
+
+            // Check if this is an EngineRequest (V3 agent requesting tool execution).
+            // EngineRequests have an 'actions' property and are NOT normal node output.
+            const isEngineReq = result && typeof result === 'object' && 'actions' in result
+
             try {
-              if (CAPTURE_IO) {
-                // Always log output structure to diagnose extraction issues
-                console.log(`${LOGPREFIX}: [output] node=${node?.name} type=${node?.type}`,
-                  'result keys:', result ? Object.keys(result) : 'null',
-                  'data type:', typeof result?.data,
-                  'isArray:', Array.isArray(result?.data))
+              if (CAPTURE_IO && !isEngineReq) {
+                if (DEBUG) {
+                  console.log(`${LOGPREFIX}: [output] node=${node?.name} type=${node?.type}`,
+                    'result keys:', result ? Object.keys(result) : 'null',
+                    'data type:', typeof result?.data,
+                    'isArray:', Array.isArray(result?.data))
+                }
                 if (result?.data && Array.isArray(result.data)) {
-                  result.data.forEach((conn, i) => {
-                    if (conn && Array.isArray(conn)) {
-                      conn.forEach((item, j) => {
-                        const keys = item ? Object.keys(item) : []
-                        const jsonKeys = item?.json ? Object.keys(item.json).slice(0, 5) : []
-                        console.log(`${LOGPREFIX}: [output]   data[${i}][${j}] item keys: [${keys}], json keys: [${jsonKeys}]`)
-                      })
-                    } else {
-                      console.log(`${LOGPREFIX}: [output]   data[${i}] = ${conn === null ? 'null' : typeof conn}`)
-                    }
-                  })
+                  if (DEBUG) {
+                    result.data.forEach((conn, i) => {
+                      if (conn && Array.isArray(conn)) {
+                        conn.forEach((item, j) => {
+                          const keys = item ? Object.keys(item) : []
+                          const jsonKeys = item?.json ? Object.keys(item.json).slice(0, 5) : []
+                          console.log(`${LOGPREFIX}: [output]   data[${i}][${j}] item keys: [${keys}], json keys: [${jsonKeys}]`)
+                        })
+                      } else {
+                        console.log(`${LOGPREFIX}: [output]   data[${i}] = ${conn === null ? 'null' : typeof conn}`)
+                      }
+                    })
+                  }
                 }
                 const extracted = extractNodeOutput(result)
                 if (extracted) {
                   const outputStr = truncateIO(safeJSONStringify(extracted))
-                  // OpenInference output attributes
                   nodeSpan.setAttribute('output.value', outputStr)
                   nodeSpan.setAttribute('output.mime_type', 'application/json')
 
-                  // For LLM spans, set llm.output_messages
                   if (spanKind === 'LLM' && extracted.primary) {
                     nodeSpan.setAttribute('llm.output_messages.0.message.role', 'assistant')
                     nodeSpan.setAttribute('llm.output_messages.0.message.content',
@@ -930,6 +919,8 @@ function setupN8nOpenTelemetry() {
                 } else if (DEBUG) {
                   console.debug(`${LOGPREFIX}: No output extracted for ${node?.name}`)
                 }
+              } else if (isEngineReq && DEBUG) {
+                console.debug(`${LOGPREFIX}: Node ${node?.name} returned EngineRequest (tool calls pending), skipping output capture`)
               }
             } catch (error) {
               console.warn('Failed to set node output attributes: ', error)
