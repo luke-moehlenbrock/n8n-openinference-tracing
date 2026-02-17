@@ -1,6 +1,7 @@
 # n8n-arize
 
 Deep n8n Observability with OpenTelemetry + Arize (OpenInference)
+
 Based on https://github.com/rwb-truelime/n8n-langfuse
 
 ## ⚠️ IMPORTANT DISCLAIMER ⚠️
