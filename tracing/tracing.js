@@ -911,10 +911,96 @@ function setupN8nOpenTelemetry() {
                   nodeSpan.setAttribute('output.value', outputStr)
                   nodeSpan.setAttribute('output.mime_type', 'application/json')
 
-                  if (spanKind === 'LLM' && extracted.primary) {
-                    nodeSpan.setAttribute('llm.output_messages.0.message.role', 'assistant')
-                    nodeSpan.setAttribute('llm.output_messages.0.message.content',
-                      typeof extracted.primary === 'string' ? extracted.primary : safeJSONStringify(extracted.primary))
+                  if (spanKind === 'LLM') {
+                    try {
+                      const outputItems = extracted?.items || []
+                      const firstItem = outputItems[0] || {}
+
+                      // LangChain-style generation data: { generations: [[{text, message}]], llmOutput: {...} }
+                      const generations = firstItem.generations
+                      let hasLLMOutput = false
+
+                      if (generations && Array.isArray(generations) && generations[0]?.length) {
+                        const gen = generations[0][0]
+                        const textContent = gen?.text || ''
+
+                        nodeSpan.setAttribute('llm.output_messages.0.message.role', 'assistant')
+                        if (textContent) {
+                          nodeSpan.setAttribute('llm.output_messages.0.message.content', textContent)
+                        }
+
+                        // Extract tool calls from the generation message.
+                        // The message can appear in multiple forms:
+                        // - Class instance: msg.tool_calls (direct), msg.lc_kwargs.tool_calls (getter)
+                        // - JSON-serialized: msg.kwargs.tool_calls (toJSON() uses kwargs not lc_kwargs)
+                        // - OpenAI raw format: msg.additional_kwargs.tool_calls or msg.kwargs.additional_kwargs.tool_calls
+                        const msg = gen?.message
+                        let toolCalls = []
+                        if (msg) {
+                          if (DEBUG) {
+                            console.debug(`${LOGPREFIX}: [LLM output] message keys: [${Object.keys(msg)}]`,
+                              'tool_calls?', !!msg.tool_calls,
+                              'kwargs?.tool_calls?', !!msg.kwargs?.tool_calls,
+                              'lc_kwargs?.tool_calls?', !!msg.lc_kwargs?.tool_calls)
+                          }
+                          toolCalls =
+                            msg.tool_calls ||                                   // class instance direct property
+                            msg.lc_kwargs?.tool_calls ||                         // class instance lc_kwargs getter
+                            msg.kwargs?.tool_calls ||                            // JSON.stringify serialized form
+                            msg.additional_kwargs?.tool_calls ||                  // OpenAI format on instance
+                            msg.kwargs?.additional_kwargs?.tool_calls ||          // OpenAI format in serialized form
+                            []
+                        } else if (DEBUG) {
+                          console.debug(`${LOGPREFIX}: [LLM output] generation has no message property. gen keys: [${gen ? Object.keys(gen) : 'null'}]`)
+                        }
+
+                        if (Array.isArray(toolCalls) && toolCalls.length) {
+                          toolCalls.forEach((tc, idx) => {
+                            // Handle both LangChain normalized ({name, args}) and OpenAI raw ({function: {name, arguments}})
+                            const fnName = tc.name || tc.function?.name || 'unknown'
+                            const fnArgs = tc.args || tc.function?.arguments || {}
+                            nodeSpan.setAttribute(
+                              `llm.output_messages.0.message.tool_calls.${idx}.tool_call.function.name`,
+                              fnName
+                            )
+                            nodeSpan.setAttribute(
+                              `llm.output_messages.0.message.tool_calls.${idx}.tool_call.function.arguments`,
+                              typeof fnArgs === 'string' ? fnArgs : safeJSONStringify(fnArgs)
+                            )
+                          })
+                        }
+                        hasLLMOutput = true
+                      }
+
+                      // Extract token usage and response id from llmOutput
+                      const llmOutput = firstItem.llmOutput
+                      if (llmOutput) {
+                        if (llmOutput.id) {
+                          nodeSpan.setAttribute('llm.response.id', llmOutput.id)
+                        }
+                        const usage = llmOutput.estimatedTokenUsage || llmOutput.tokenUsage
+                        if (usage) {
+                          if (usage.promptTokens != null)
+                            nodeSpan.setAttribute('llm.token_count.prompt', usage.promptTokens)
+                          if (usage.completionTokens != null)
+                            nodeSpan.setAttribute('llm.token_count.completion', usage.completionTokens)
+                          if (usage.totalTokens != null)
+                            nodeSpan.setAttribute('llm.token_count.total', usage.totalTokens)
+                        }
+                        hasLLMOutput = true
+                      }
+
+                      // Fallback: no generations format but have primary text content
+                      if (!hasLLMOutput && extracted.primary) {
+                        nodeSpan.setAttribute('llm.output_messages.0.message.role', 'assistant')
+                        nodeSpan.setAttribute('llm.output_messages.0.message.content',
+                          typeof extracted.primary === 'string'
+                            ? extracted.primary
+                            : safeJSONStringify(extracted.primary))
+                      }
+                    } catch (e) {
+                      if (DEBUG) console.warn('[Tracing] Failed to enrich LLM span output', e)
+                    }
                   }
                 } else if (DEBUG) {
                   console.debug(`${LOGPREFIX}: No output extracted for ${node?.name}`)
